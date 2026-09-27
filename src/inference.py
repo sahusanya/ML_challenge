@@ -1,135 +1,395 @@
 import os
 import pickle
-import numpy as np
+import sqlite3
+
 import pandas as pd
 
 from src.preprocess import load_source_file, preprocess_dataframe
-from src.blocking import CandidateBlocker
+from src.scalable_blocking import ScalableBlocker
 from src.feature_engineering import PairFeatureExtractor
 from utils.validate_submission import validate_submission
 
-def run_test_inference(
-    test_dir="dataset/test",
-    model_path="models/er_model.pkl",
-    candidate_output_path="output/candidate_pairs.tsv",
-    matching_output_path="output/matching_results.tsv"
-):
-    print("=== Starting Test Set Inference & Submission Generation ===")
-    
-    # 1. Load saved model artifacts
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Trained model not found at {model_path}. Please run train.py first.")
 
-    with open(model_path, "rb") as f:
+TEST_DIR = "dataset/test"
+MODEL_PATH = "models/real_er_model.pkl"
+DB_PATH = "models/test_blocker.db"
+
+CANDIDATE_OUTPUT = "output/candidate_pairs.tsv"
+MATCHING_OUTPUT = "output/matching_results.tsv"
+
+
+def run_test_inference():
+
+    print("=" * 60)
+    print("REAL TEST SET INFERENCE")
+    print("=" * 60)
+
+    # ---------------------------------------------------------
+    # 1. Load trained model
+    # ---------------------------------------------------------
+
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model not found: {MODEL_PATH}"
+        )
+
+    with open(MODEL_PATH, "rb") as f:
         artifacts = pickle.load(f)
 
     model = artifacts["model"]
-    blocker = artifacts["blocker"]
-    optimal_threshold = artifacts["optimal_threshold"]
-    
-    print(f"Loaded model from {model_path}. Using optimal classification threshold: {optimal_threshold:.2f}")
+    threshold = artifacts["optimal_threshold"]
 
-    # 2. Load test source files
-    s1_path = os.path.join(test_dir, "test_source1.tsv")
-    s2_path = os.path.join(test_dir, "test_source2.tsv")
-    s3_path = os.path.join(test_dir, "test_source3.tsv")
+    name_limit = artifacts.get("name_limit", 50)
+    address_limit = artifacts.get("address_limit", 50)
 
-    df_s1 = load_source_file(s1_path)
-    df_s2 = load_source_file(s2_path)
-    df_s3 = load_source_file(s3_path)
+    print(f"Model: {MODEL_PATH}")
+    print(f"Threshold: {threshold:.2f}")
+    print(f"Name candidate limit: {name_limit}")
+    print(f"Address candidate limit: {address_limit}")
 
-    df_s1 = preprocess_dataframe(df_s1)
-    df_s2 = preprocess_dataframe(df_s2)
-    df_s3 = preprocess_dataframe(df_s3)
+    # ---------------------------------------------------------
+    # 2. Load test data
+    # ---------------------------------------------------------
 
-    # 3. Stage 1: Candidate Generation (Blocking)
-    print("Generating Candidate Pairs for Test Set...")
-    candidate_pairs_map = blocker.fit_transform_candidates(df_s1, df_s2, df_s3)
+    s1_path = os.path.join(TEST_DIR, "test_source1.tsv")
+    s2_path = os.path.join(TEST_DIR, "test_source2.tsv")
+    s3_path = os.path.join(TEST_DIR, "test_source3.tsv")
 
-    # Save output/candidate_pairs.tsv
-    blocker.save_candidate_pairs(candidate_pairs_map, output_path=candidate_output_path)
+    print("\nLoading test files...")
 
-    # 4. Construct Pairwise Test Features
-    df_s1_indexed = df_s1.set_index("entity_id")
-    df_cand_indexed = pd.concat([df_s2, df_s3], ignore_index=True).set_index("entity_id")
+    df_s1 = preprocess_dataframe(load_source_file(s1_path))
+    df_s2 = preprocess_dataframe(load_source_file(s2_path))
+    df_s3 = preprocess_dataframe(load_source_file(s3_path))
 
-    pair_rows = []
-    for s1_id in df_s1["entity_id"]:
-        cand_list = candidate_pairs_map.get(s1_id, [])
-        s1_rec = df_s1_indexed.loc[s1_id]
+    print(f"S1 records: {len(df_s1)}")
+    print(f"S2 records: {len(df_s2)}")
+    print(f"S3 records: {len(df_s3)}")
 
-        for cand_id in cand_list:
-            if cand_id not in df_cand_indexed.index:
+    # ---------------------------------------------------------
+    # 3. Open scalable blocker
+    # ---------------------------------------------------------
+
+    print("\nOpening test blocker database...")
+
+    blocker = ScalableBlocker(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+
+    # ---------------------------------------------------------
+    # 4. Generate candidate pairs
+    # ---------------------------------------------------------
+
+    print("\nGenerating candidate pairs...")
+
+    candidate_rows = []
+    candidate_pairs_for_output = []
+
+    s1_count = len(df_s1)
+
+    for idx, s1 in df_s1.iterrows():
+
+        if (idx + 1) % 50 == 0 or idx + 1 == s1_count:
+            print(
+                f"Processed {idx + 1}/{s1_count} S1 entities | "
+                f"candidate pairs: {len(candidate_rows)}"
+            )
+
+        s1_id = s1["entity_id"]
+
+        records = blocker.get_candidate_records(
+            business_name=s1["business_name"],
+            business_address=s1["business_address"],
+            country=s1["country"],
+            name_limit=name_limit,
+            address_limit=address_limit,
+            conn=conn
+        )
+
+        seen = set()
+
+        for (
+            cand_id,
+            cand_source,
+            cand_country,
+            cand_name,
+            cand_address
+        ) in records:
+
+            key = (cand_id, cand_source)
+
+            if key in seen:
                 continue
-            cand_rec = df_cand_indexed.loc[cand_id]
 
-            pair_rows.append({
+            seen.add(key)
+
+            candidate_rows.append({
                 "source1_entity_id": s1_id,
                 "candidate_entity_id": cand_id,
-                "s1_business_name": s1_rec["business_name"],
-                "s1_business_address": s1_rec["business_address"],
-                "s1_country": s1_rec["country"],
-                "s1_norm_name": s1_rec["norm_name"],
-                "s1_norm_address": s1_rec["norm_address"],
-                "cand_business_name": cand_rec["business_name"],
-                "cand_business_address": cand_rec["business_address"],
-                "cand_country": cand_rec["country"],
-                "cand_norm_name": cand_rec["norm_name"],
-                "cand_norm_address": cand_rec["norm_address"]
+                "candidate_source": cand_source,
+
+                "s1_business_name": s1["business_name"],
+                "s1_business_address": s1["business_address"],
+                "s1_country": s1["country"],
+
+                "s1_norm_name": s1["norm_name"],
+                "s1_norm_address": s1["norm_address"],
+
+                "cand_business_name": cand_name,
+                "cand_business_address": cand_address,
+                "cand_country": cand_country,
+
+                "cand_norm_name": "",
+                "cand_norm_address": ""
             })
 
-    if not pair_rows:
-        # Fallback if no candidate pairs generated at all
-        print("Warning: No candidate pairs were generated during test inference.")
-        matching_rows = [{"source1_entity_id": s1_id, "matched_entity_ids": ""} for s1_id in df_s1["entity_id"]]
-        pd.DataFrame(matching_rows).to_csv(matching_output_path, sep="\t", index=False)
+            candidate_pairs_for_output.append({
+                "source1_entity_id": s1_id,
+                "candidate_entity_id": cand_id,
+                "candidate_source": cand_source
+            })
+
+    conn.close()
+
+    print("\nCandidate generation complete.")
+    print(f"Total candidate pairs: {len(candidate_rows)}")
+
+    # ---------------------------------------------------------
+    # 5. Build candidate dataframe
+    # ---------------------------------------------------------
+
+    if not candidate_rows:
+
+        print("No candidates generated.")
+
+        matching_rows = [
+            {
+                "source1_entity_id": s1_id,
+                "matched_entity_ids": ""
+            }
+            for s1_id in df_s1["entity_id"]
+        ]
+
+        os.makedirs("output", exist_ok=True)
+
+        pd.DataFrame(matching_rows).to_csv(
+            MATCHING_OUTPUT,
+            sep="\t",
+            index=False
+        )
+
+        pd.DataFrame(
+            columns=[
+                "source1_entity_id",
+                "candidate_entity_id",
+                "candidate_source"
+            ]
+        ).to_csv(
+            CANDIDATE_OUTPUT,
+            sep="\t",
+            index=False
+        )
+
+        print("Empty submission generated.")
         return
 
-    df_test_pairs = pd.DataFrame(pair_rows)
+    df_pairs = pd.DataFrame(candidate_rows)
 
-    # Extract Features
-    print("Extracting Test Pair Similarity Features...")
+    # ---------------------------------------------------------
+    # 6. Normalize candidate records
+    # ---------------------------------------------------------
+
+    print("\nPreparing candidate records...")
+
+    # We have the complete test S2/S3 data locally.
+    # Use entity_id + source to retrieve normalized values.
+
+    df_s2_lookup = df_s2[
+        [
+            "entity_id",
+            "country",
+            "business_name",
+            "business_address",
+            "norm_name",
+            "norm_address"
+        ]
+    ].copy()
+
+    df_s2_lookup["candidate_source"] = "S2"
+
+    df_s3_lookup = df_s3[
+        [
+            "entity_id",
+            "country",
+            "business_name",
+            "business_address",
+            "norm_name",
+            "norm_address"
+        ]
+    ].copy()
+
+    df_s3_lookup["candidate_source"] = "S3"
+
+    df_candidates = pd.concat(
+        [df_s2_lookup, df_s3_lookup],
+        ignore_index=True
+    )
+
+    df_candidates = df_candidates.rename(
+        columns={
+            "entity_id": "candidate_entity_id",
+            "country": "cand_country",
+            "business_name": "cand_business_name",
+            "business_address": "cand_business_address",
+            "norm_name": "cand_norm_name",
+            "norm_address": "cand_norm_address"
+        }
+    )
+
+    df_pairs = df_pairs.drop(
+        columns=[
+            "cand_business_name",
+            "cand_business_address",
+            "cand_country",
+            "cand_norm_name",
+            "cand_norm_address"
+        ]
+    )
+
+    df_pairs = df_pairs.merge(
+        df_candidates,
+        on=["candidate_entity_id", "candidate_source"],
+        how="left"
+    )
+
+    print(f"Pair dataframe shape: {df_pairs.shape}")
+
+    # ---------------------------------------------------------
+    # 7. Save candidate_pairs.tsv
+    # ---------------------------------------------------------
+
+    os.makedirs("output", exist_ok=True)
+
+    candidate_df = pd.DataFrame(candidate_pairs_for_output)
+
+    candidate_grouped = (
+        candidate_df
+        .groupby("source1_entity_id")["candidate_entity_id"]
+        .apply(lambda ids: ",".join(dict.fromkeys(ids)))
+        .reset_index()
+    )
+
+    candidate_grouped.columns = [
+        "source1_entity_id",
+        "candidate_entity_ids"
+    ]
+
+    candidate_grouped.to_csv(
+        CANDIDATE_OUTPUT,
+        sep="\t",
+        index=False
+    )
+
+    print(
+        f"Candidate file written: {CANDIDATE_OUTPUT}"
+    )
+
+    # ---------------------------------------------------------
+    # 8. Extract features
+    # ---------------------------------------------------------
+
+    print("\nExtracting pair features...")
+
     extractor = PairFeatureExtractor()
-    X_test = extractor.extract_pair_features(df_test_pairs)
 
-    # 5. Predict Match Probabilities
-    print("Predicting Match Probabilities with Model...")
-    probs = model.predict_proba(X_test)[:, 1]
-    df_test_pairs["match_prob"] = probs
+    X_test = extractor.extract_pair_features(df_pairs)
 
-    # Filter by Optimal Threshold
-    df_surviving = df_test_pairs[df_test_pairs["match_prob"] >= optimal_threshold]
+    print(f"Feature matrix: {X_test.shape}")
 
-    matched_dict = df_surviving.groupby("source1_entity_id")["candidate_entity_id"].apply(list).to_dict()
+    # ---------------------------------------------------------
+    # 9. Predict
+    # ---------------------------------------------------------
 
-    # 6. Build Final matching_results.tsv
+    print("\nPredicting match probabilities...")
+
+    probabilities = model.predict_proba(X_test)[:, 1]
+
+    df_pairs["match_prob"] = probabilities
+
+    # ---------------------------------------------------------
+    # 10. Apply threshold
+    # ---------------------------------------------------------
+
+    df_surviving = df_pairs[
+        df_pairs["match_prob"] >= threshold
+    ].copy()
+
+    print(
+        f"Pairs above threshold: {len(df_surviving)}"
+    )
+
+    # ---------------------------------------------------------
+    # 11. Build matching_results.tsv
+    # ---------------------------------------------------------
+
+    matched_dict = (
+        df_surviving
+        .groupby("source1_entity_id")["candidate_entity_id"]
+        .apply(list)
+        .to_dict()
+    )
+
     matching_rows = []
+
     for s1_id in df_s1["entity_id"]:
+
         matched_ids = matched_dict.get(s1_id, [])
-        # Preserve unique ordering
-        unique_matched = []
+
+        # Remove duplicates while preserving order.
+        unique_ids = []
         seen = set()
-        for m_id in matched_ids:
-            if m_id not in seen:
-                seen.add(m_id)
-                unique_matched.append(m_id)
+
+        for entity_id in matched_ids:
+
+            if entity_id not in seen:
+                seen.add(entity_id)
+                unique_ids.append(entity_id)
 
         matching_rows.append({
             "source1_entity_id": s1_id,
-            "matched_entity_ids": ",".join(unique_matched)
+            "matched_entity_ids": ",".join(unique_ids)
         })
 
-    os.makedirs(os.path.dirname(matching_output_path), exist_ok=True)
-    df_out = pd.DataFrame(matching_rows)
-    df_out.to_csv(matching_output_path, sep="\t", index=False)
-    print(f"Successfully generated {len(df_out)} matching result rows in {matching_output_path}")
+    df_matching = pd.DataFrame(matching_rows)
 
-    # 7. Validate Submission Format
-    validate_submission(
-        matching_path=matching_output_path,
-        candidate_path=candidate_output_path,
-        test_dir=test_dir
+    df_matching.to_csv(
+        MATCHING_OUTPUT,
+        sep="\t",
+        index=False
     )
+
+    print(
+        f"Matching file written: {MATCHING_OUTPUT}"
+    )
+
+    print(
+        f"Rows in matching_results.tsv: {len(df_matching)}"
+    )
+
+    # ---------------------------------------------------------
+    # 12. Validate submission
+    # ---------------------------------------------------------
+
+    print("\nRunning official validator...")
+
+    validate_submission(
+        matching_path=MATCHING_OUTPUT,
+        candidate_path=CANDIDATE_OUTPUT,
+        test_dir=TEST_DIR
+    )
+
+    print("\n" + "=" * 60)
+    print("INFERENCE COMPLETE")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     run_test_inference()
