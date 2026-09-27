@@ -272,7 +272,6 @@ class ScalableBlocker:
         tokens,
         limit=50
     ):
-
         if not tokens:
             return []
 
@@ -285,26 +284,24 @@ class ScalableBlocker:
         conditions = []
 
         for token in tokens:
-
-            token = self._fts_escape(
-                token
-            )
+            token = self._fts_escape(token)
 
             conditions.append(
                 f'{field}:"{token}"*'
             )
 
-        query = " OR ".join(
-            conditions
-        )
+        query = " OR ".join(conditions)
 
         sql = f"""
             SELECT
                 entity_id,
-                source
+                source,
+                country,
+                business_name,
+                business_address
             FROM candidates
             WHERE candidates MATCH ?
-              AND country = ?
+            AND country = ?
             ORDER BY bm25(candidates)
             LIMIT ?
         """
@@ -377,6 +374,55 @@ class ScalableBlocker:
     # =========================================================
     # MAIN CANDIDATE GENERATION
     # =========================================================
+    def get_candidate_records(
+        self,
+        business_name,
+        business_address,
+        country,
+        name_limit=50,
+        address_limit=50,
+        conn=None
+    ):
+        own_connection = False
+
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            own_connection = True
+
+        norm_name = normalize_text(business_name)
+        norm_address = normalize_text(business_address)
+
+        name_tokens = self._tokens(norm_name)
+        address_tokens = self._address_tokens(norm_address)
+
+        candidates = {}
+
+        # Name FTS
+        for row in self._search(
+            conn,
+            country,
+            "business_name",
+            name_tokens,
+            name_limit
+        ):
+            entity_id, source, row_country, name, address = row
+            candidates[(entity_id, source)] = row
+
+        # Address FTS
+        for row in self._search(
+            conn,
+            country,
+            "business_address",
+            address_tokens,
+            address_limit
+        ):
+            entity_id, source, row_country, name, address = row
+            candidates[(entity_id, source)] = row
+
+        if own_connection:
+            conn.close()
+
+        return list(candidates.values())
 
     def get_candidates(
         self,
